@@ -4309,3 +4309,73 @@ def test_rabbitmq_read_consumers_in_parallel(rabbitmq_cluster, unique):
     # Read in parallel, a message waits about one flush interval (1 s). Read one after another, about half of them
     # waited longer than 5 s.
     assert int(late) < messages_num // 20, f"{late} messages inserted more than 5 s after publishing (max {max_delay} s)"
+
+
+def test_rabbitmq_squash_blocks_before_insert(rabbitmq_cluster, db, unique):
+    # Each consumer's block used to become its own part per materialized view and flush cycle.
+    # Now the blocks of one cycle are squashed into one insert.
+    num_consumers = 4
+    block_size = 50
+    messages_num = 2000
+    instance.query(
+        f"""
+        CREATE TABLE {db}.rabbitmq (key UInt64, value UInt64)
+            ENGINE = RabbitMQ
+            SETTINGS rabbitmq_host_port = 'rabbitmq1:5672',
+                     rabbitmq_exchange_name = '{unique}',
+                     rabbitmq_queue_base = '{unique}',
+                     rabbitmq_num_consumers = {num_consumers},
+                     rabbitmq_num_queues = {num_consumers},
+                     rabbitmq_max_block_size = {block_size},
+                     rabbitmq_flush_interval_ms = 1000,
+                     rabbitmq_format = 'JSONEachRow';
+
+        CREATE TABLE {db}.view (key UInt64, value UInt64)
+            ENGINE = MergeTree()
+            ORDER BY key;
+
+        SYSTEM STOP MERGES {db}.view;
+        """
+    )
+
+    instance.query(
+        f"CREATE MATERIALIZED VIEW {db}.consumer TO {db}.view AS SELECT * FROM {db}.rabbitmq"
+    )
+
+    credentials = pika.PlainCredentials("root", "clickhouse")
+    parameters = pika.ConnectionParameters(
+        rabbitmq_cluster.rabbitmq_ip, rabbitmq_cluster.rabbitmq_port, "/", credentials
+    )
+    connection = pika.BlockingConnection(parameters)
+    channel = connection.channel()
+    channel.confirm_delivery()
+
+    # Every consumer subscribes to every queue. Publish only once all are subscribed: otherwise the first one
+    # can take the whole backlog and no cycle has more than one consumer's block.
+    queues = [f"{q}_{unique}" for q in range(1, num_consumers + 1)]
+    deadline = time.monotonic() + DEFAULT_TIMEOUT_SEC
+    while time.monotonic() < deadline and any(
+        channel.queue_declare(queue=q, passive=True).method.consumer_count < num_consumers for q in queues
+    ):
+        time.sleep(0.1)
+    assert all(
+        channel.queue_declare(queue=q, passive=True).method.consumer_count >= num_consumers for q in queues
+    ), "not all consumers subscribed"
+
+    # The message_id spreads the messages over the queues of the hash exchange.
+    for i in range(messages_num):
+        channel.basic_publish(
+            exchange=unique,
+            routing_key="",
+            properties=pika.BasicProperties(message_id=str(i)),
+            body=json.dumps({"key": i, "value": i}),
+        )
+    connection.close()
+
+    check_expected_result_polling(messages_num, f"SELECT uniqExact(key) FROM {db}.view")
+    assert int(instance.query(f"SELECT count() FROM {db}.view")) == messages_num
+    max_rows = int(instance.query(
+        f"SELECT max(rows) FROM system.parts WHERE database = '{db}' AND table = 'view' AND active"
+    ))
+    # Without squashing every part holds at most one consumer block of `block_size` rows.
+    assert max_rows > block_size, f"no part holds more than one consumer block: {max_rows} rows"
