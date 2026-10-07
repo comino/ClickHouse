@@ -886,9 +886,14 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
     if (!body)
         return;
 
-    /// A missing table may be a staged one, which the commit creates.
     const auto pointer = warehouse.store->getTable(*ns, table);
-    auto metadata = pointer ? readTableMetadata(warehouse, *pointer) : nullptr;
+    if (!pointer)
+    {
+        /// A missing table may be a staged one, which the commit creates.
+        handleCreateCommit(warehouse, *ns, table, *body, response, context);
+        return;
+    }
+    auto metadata = readTableMetadata(warehouse, *pointer);
 
     CompressionMethod compression_method = CompressionMethod::None;
     try
@@ -897,36 +902,20 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
         const auto requirements = getArray(*json, "requirements");
         const auto updates = getArray(*json, "updates");
 
-        if (!pointer && !hasAssertCreate(*requirements))
-        {
-            sendNoSuchTable(response, *ns, table);
-            return;
-        }
-
-        if (const auto failed = checkTableRequirements(metadata.get(), *requirements))
+        if (const auto failed = checkTableRequirements(*metadata, *requirements))
         {
             sendError(response, Poco::Net::HTTPResponse::HTTP_CONFLICT, "CommitFailedException", *failed);
             return;
         }
 
-        if (!pointer)
+        /// Do not write a new metadata version for an empty commit.
+        if (updates->size() == 0)
         {
-            checkDDLAllowed(context, "create table");
-            validateTableName(table);
-            metadata = buildCreatedTableMetadata(*updates);
-            validateTableLocation(warehouse, getString(*metadata, Iceberg::f_location));
-        }
-        else if (updates->size() == 0)
-        {
-            /// Do not write a new metadata version for an empty commit.
             sendCommitTableResult(pointer->metadata_location, metadata, response);
             return;
         }
-        else
-        {
-            applyTableUpdates(*metadata, *updates, pointer->metadata_location);
-        }
 
+        applyTableUpdates(*metadata, *updates, pointer->metadata_location);
         /// A `set-properties` update may change the codec. The new file follows the updated properties.
         compression_method = getMetadataCompressionMethod(*metadata);
     }
@@ -944,10 +933,58 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
         return;
     }
 
-    if (pointer)
-        commitTableMetadata(warehouse, *ns, table, *pointer, metadata, compression_method, response);
-    else
-        commitStagedTable(warehouse, *ns, table, metadata, compression_method, response);
+    commitTableMetadata(warehouse, *ns, table, *pointer, metadata, compression_method, response);
+}
+
+void IcebergRESTCatalogHandler::handleCreateCommit(
+    const IcebergRESTCatalogWarehouse & warehouse,
+    const IcebergNamespaceName & ns,
+    const String & table,
+    const String & body,
+    HTTPServerResponse & response,
+    const Context & context) const
+{
+    Poco::JSON::Object::Ptr metadata;
+    CompressionMethod compression_method = CompressionMethod::None;
+    try
+    {
+        const auto json = Poco::JSON::Parser().parse(body).extract<Poco::JSON::Object::Ptr>();
+        const auto requirements = getArray(*json, "requirements");
+        const auto updates = getArray(*json, "updates");
+
+        if (!hasAssertCreate(*requirements))
+        {
+            sendNoSuchTable(response, ns, table);
+            return;
+        }
+
+        if (const auto failed = checkCreateRequirements(*requirements))
+        {
+            sendError(response, Poco::Net::HTTPResponse::HTTP_CONFLICT, "CommitFailedException", *failed);
+            return;
+        }
+
+        checkDDLAllowed(context, "create table");
+        validateTableName(table);
+        metadata = buildCreatedTableMetadata(*updates);
+        validateTableLocation(warehouse, getString(*metadata, Iceberg::f_location));
+        compression_method = getMetadataCompressionMethod(*metadata);
+    }
+    catch (const Exception & e)
+    {
+        /// Other errors are not caused by the client. The HTTP layer reports them as internal errors.
+        if (e.code() != ErrorCodes::NOT_IMPLEMENTED && e.code() != ErrorCodes::BAD_ARGUMENTS)
+            throw;
+        sendCommitRequestError(response, e.code(), e.message());
+        return;
+    }
+    catch (const Poco::Exception & e)
+    {
+        sendCommitRequestError(response, ErrorCodes::BAD_ARGUMENTS, e.displayText());
+        return;
+    }
+
+    commitStagedTable(warehouse, ns, table, metadata, compression_method, response);
 }
 
 KeeperIcebergRESTCatalogStore::CreateTableResult IcebergRESTCatalogHandler::writeAndRegisterTable(

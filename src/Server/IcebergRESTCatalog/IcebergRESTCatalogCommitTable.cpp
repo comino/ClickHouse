@@ -32,6 +32,13 @@ namespace
 
 using RequirementCheck = std::optional<String> (*)(const Poco::JSON::Object & metadata, const Poco::JSON::Object & requirement);
 
+/// Verify table does not exist.
+std::optional<String> checkCreate(const Poco::JSON::Object &, const Poco::JSON::Object &)
+{
+    /// The table exists at this point. A commit to a missing table goes through `checkCreateRequirements`.
+    return "Table already exists";
+}
+
 /// Verify table has expected UUID.
 std::optional<String> checkTableUuid(const Poco::JSON::Object & metadata, const Poco::JSON::Object & requirement)
 {
@@ -77,6 +84,7 @@ std::optional<String> checkInteger(
 }
 
 const std::unordered_map<String, RequirementCheck> REQUIREMENT_CHECKS = {
+    {"assert-create", checkCreate},
     {"assert-table-uuid", checkTableUuid},
     {"assert-ref-snapshot-id", checkRefSnapshotId},
     {"assert-current-schema-id",
@@ -104,7 +112,26 @@ bool hasAssertCreate(const Poco::JSON::Array & requirements)
     return false;
 }
 
-std::optional<String> checkTableRequirements(const Poco::JSON::Object * metadata, const Poco::JSON::Array & requirements)
+std::optional<String> checkTableRequirements(const Poco::JSON::Object & metadata, const Poco::JSON::Array & requirements)
+{
+    for (const auto & requirement : requirements)
+    {
+        if (requirement.type() != typeid(Poco::JSON::Object::Ptr))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Every requirement must be an object");
+        const auto & requirement_object = requirement.extract<Poco::JSON::Object::Ptr>();
+
+        const auto type = getString(*requirement_object, f_type);
+        const auto it = REQUIREMENT_CHECKS.find(type);
+        if (it == REQUIREMENT_CHECKS.end())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown requirement type '{}'", type);
+
+        if (auto failed = it->second(metadata, *requirement_object))
+            return failed;
+    }
+    return std::nullopt;
+}
+
+std::optional<String> checkCreateRequirements(const Poco::JSON::Array & requirements)
 {
     for (const auto & requirement : requirements)
     {
@@ -114,20 +141,10 @@ std::optional<String> checkTableRequirements(const Poco::JSON::Object * metadata
 
         const auto type = getString(*requirement_object, f_type);
         if (type == "assert-create")
-        {
-            if (metadata)
-                return "Table already exists";
             continue;
-        }
-
-        const auto it = REQUIREMENT_CHECKS.find(type);
-        if (it == REQUIREMENT_CHECKS.end())
+        if (!REQUIREMENT_CHECKS.contains(type))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown requirement type '{}'", type);
-
-        if (!metadata)
-            return fmt::format("Cannot check '{}': table does not exist", type);
-        if (auto failed = it->second(*metadata, *requirement_object))
-            return failed;
+        return fmt::format("Cannot check '{}': table does not exist", type);
     }
     return std::nullopt;
 }

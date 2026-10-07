@@ -46,6 +46,15 @@ private:
     void handleDropTable(const IcebergRESTCatalogWarehouse & warehouse, const IcebergRESTRouteMatch & match, const Poco::URI & uri, HTTPServerResponse & response, const Context & context) const;
     void handleUpdateTable(const IcebergRESTCatalogWarehouse & warehouse, const IcebergRESTRouteMatch & match, HTTPServerRequest & request, HTTPServerResponse & response, const Context & context) const;
 
+    /// Handles a commit to a missing table. A commit with `assert-create` creates a staged table. Sends the response.
+    void handleCreateCommit(
+        const IcebergRESTCatalogWarehouse & warehouse,
+        const IcebergNamespaceName & ns,
+        const String & table,
+        const String & body,
+        HTTPServerResponse & response,
+        const Context & context) const;
+
     /// Writes the first metadata file and registers the table. Removes the file if the table is not registered.
     KeeperIcebergRESTCatalogStore::CreateTableResult writeAndRegisterTable(
         const IcebergRESTCatalogWarehouse & warehouse,

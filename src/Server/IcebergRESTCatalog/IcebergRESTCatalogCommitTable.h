@@ -13,9 +13,13 @@ namespace DB
 /// True if `requirements` contain `assert-create`. Such a commit creates a staged table.
 bool hasAssertCreate(const Poco::JSON::Array & requirements);
 
-/// Checks CommitTableRequest `requirements`. `metadata` is nullptr if the table does not exist.
+/// Checks CommitTableRequest `requirements` against an existing table.
 /// Returns the reason of the first failed requirement, if any.
-std::optional<String> checkTableRequirements(const Poco::JSON::Object * metadata, const Poco::JSON::Array & requirements);
+std::optional<String> checkTableRequirements(const Poco::JSON::Object & metadata, const Poco::JSON::Array & requirements);
+
+/// Checks CommitTableRequest `requirements` for a table that does not exist. Only `assert-create` passes.
+/// Returns the reason of the first failed requirement, if any.
+std::optional<String> checkCreateRequirements(const Poco::JSON::Array & requirements);
 
 /// Applies CommitTableRequest `updates` to `metadata` in place.
 /// Throws `BAD_ARGUMENTS` for an invalid update and `NOT_IMPLEMENTED` for an unsupported one.
