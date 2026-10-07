@@ -38,6 +38,18 @@ RabbitMQConsumer::RabbitMQConsumer(
 void RabbitMQConsumer::stop()
 {
     stopped = true;
+    std::lock_guard lock(mutex);
+    cv.notify_all();
+}
+
+void RabbitMQConsumer::pushMessage(MessageData && message)
+{
+    if (!received.push(std::move(message)))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Could not push to received queue");
+
+    /// `waitForMessages` checks `received` and starts waiting while holding `mutex`. A notify without the lock
+    /// can fall between the two and is lost: the reader then sleeps until the next delivery or the flush timeout.
+    std::lock_guard lock(mutex);
     cv.notify_one();
 }
 
@@ -101,10 +113,7 @@ void RabbitMQConsumer::subscribe()
                     .delivery_tag = delivery_tag,
                     .channel_id = channel_id};
 
-                if (!received.push(std::move(result)))
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Could not push to received queue");
-
-                cv.notify_one();
+                pushMessage(std::move(result));
             }
         })
         .onError([&](const char * message)
