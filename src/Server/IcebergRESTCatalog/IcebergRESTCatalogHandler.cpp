@@ -754,7 +754,6 @@ void IcebergRESTCatalogHandler::handleCreateTable(
         name = json->getValue<String>("name");
         validateTableName(name);
 
-        /// A staged table is returned but not stored. Its first commit, with `assert-create`, creates it. Needed for CTAS.
         stage_create = json->optValue<bool>("stage-create", false);
 
         if (json->has("location") && !json->isNull("location"))
@@ -889,8 +888,8 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
     const auto pointer = warehouse.store->getTable(*ns, table);
     if (!pointer)
     {
-        /// A missing table may be a staged one, which the commit creates.
-        handleCreateCommit(warehouse, *ns, table, *body, response, context);
+        /// Creates the table if the commit has `assert-create`. Else sends 404.
+        handleCommitToMissingTable(warehouse, *ns, table, *body, response, context);
         return;
     }
     auto metadata = readTableMetadata(warehouse, *pointer);
@@ -936,7 +935,7 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
     commitTableMetadata(warehouse, *ns, table, *pointer, metadata, compression_method, response);
 }
 
-void IcebergRESTCatalogHandler::handleCreateCommit(
+void IcebergRESTCatalogHandler::handleCommitToMissingTable(
     const IcebergRESTCatalogWarehouse & warehouse,
     const IcebergNamespaceName & ns,
     const String & table,
@@ -984,7 +983,7 @@ void IcebergRESTCatalogHandler::handleCreateCommit(
         return;
     }
 
-    commitStagedTable(warehouse, ns, table, metadata, compression_method, response);
+    createTableFromCommit(warehouse, ns, table, metadata, compression_method, response);
 }
 
 KeeperIcebergRESTCatalogStore::CreateTableResult IcebergRESTCatalogHandler::writeAndRegisterTable(
@@ -1016,7 +1015,7 @@ KeeperIcebergRESTCatalogStore::CreateTableResult IcebergRESTCatalogHandler::writ
     return created;
 }
 
-void IcebergRESTCatalogHandler::commitStagedTable(
+void IcebergRESTCatalogHandler::createTableFromCommit(
     const IcebergRESTCatalogWarehouse & warehouse,
     const IcebergNamespaceName & ns,
     const String & table,
@@ -1033,7 +1032,7 @@ void IcebergRESTCatalogHandler::commitStagedTable(
     switch (writeAndRegisterTable(warehouse, ns, table, pointer, metadata, compression_method))
     {
         case CreateTableResult::Created:
-            LOG_INFO(log, "Created staged table {}.{} at {}", joinNamespace(ns), table, pointer.metadata_location);
+            LOG_INFO(log, "Created table {}.{} at {}", joinNamespace(ns), table, pointer.metadata_location);
             sendCommitTableResult(pointer.metadata_location, metadata, response);
             return;
         case CreateTableResult::TableExists:

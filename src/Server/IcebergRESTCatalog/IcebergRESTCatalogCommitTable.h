@@ -10,7 +10,7 @@
 namespace DB
 {
 
-/// True if `requirements` contain `assert-create`. Such a commit creates a staged table.
+/// True if `requirements` contain `assert-create`. Such a commit creates the table.
 bool hasAssertCreate(const Poco::JSON::Array & requirements);
 
 /// Checks CommitTableRequest `requirements` against an existing table.

@@ -46,8 +46,8 @@ private:
     void handleDropTable(const IcebergRESTCatalogWarehouse & warehouse, const IcebergRESTRouteMatch & match, const Poco::URI & uri, HTTPServerResponse & response, const Context & context) const;
     void handleUpdateTable(const IcebergRESTCatalogWarehouse & warehouse, const IcebergRESTRouteMatch & match, HTTPServerRequest & request, HTTPServerResponse & response, const Context & context) const;
 
-    /// Handles a commit to a missing table. A commit with `assert-create` creates a staged table. Sends the response.
-    void handleCreateCommit(
+    /// Handles a commit to a missing table. Creates the table if the commit has `assert-create`. Else sends 404.
+    void handleCommitToMissingTable(
         const IcebergRESTCatalogWarehouse & warehouse,
         const IcebergNamespaceName & ns,
         const String & table,
@@ -64,8 +64,8 @@ private:
         const Poco::JSON::Object::Ptr & metadata,
         CompressionMethod compression_method) const;
 
-    /// Creates a staged table from the metadata built by its create commit. Sends the response.
-    void commitStagedTable(
+    /// Creates a table from the metadata built by a commit with `assert-create`. Sends the response.
+    void createTableFromCommit(
         const IcebergRESTCatalogWarehouse & warehouse,
         const IcebergNamespaceName & ns,
         const String & table,
