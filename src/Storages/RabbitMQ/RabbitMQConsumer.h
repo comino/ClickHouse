@@ -75,6 +75,9 @@ public:
 
     bool hasPendingMessages() { return !received.empty(); }
 
+    /// Queues a delivery and wakes a reader parked in `waitForMessages`. Runs on the event loop thread; public for tests.
+    void pushMessage(MessageData && message);
+
     void waitForMessages(std::optional<uint64_t> timeout_ms = std::nullopt, std::function<bool()> is_cancelled = {})
     {
         std::unique_lock lock(mutex);
