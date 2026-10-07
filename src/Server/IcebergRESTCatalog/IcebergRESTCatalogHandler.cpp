@@ -95,6 +95,26 @@ String getMetadataCompressionSuffix(CompressionMethod compression_method)
     return compression_method == CompressionMethod::Gzip ? ".gz" : "";
 }
 
+/// Same naming as the ClickHouse Iceberg writer: `<location>/metadata/v<version>-<uuid>.metadata.json`, starting at 1.
+String firstMetadataLocation(const String & location, const String & uuid, CompressionMethod compression_method)
+{
+    return fmt::format("{}/metadata/v1-{}{}.metadata.json", location, uuid, getMetadataCompressionSuffix(compression_method));
+}
+
+/// The handler maps `BAD_ARGUMENTS` to a 400 response.
+void validateTableLocation(const IcebergRESTCatalogWarehouse & warehouse, const String & location)
+{
+    /// The ClickHouse client sends a bare key unless `write_full_path_in_iceberg_metadata` is set. Name the problem.
+    if (!hasS3Scheme(location))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "'location' {} must be an s3:// URI", location);
+    /// The server has credentials for one bucket only.
+    if (!warehouse.isInBucket(location))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "'location' {} must be inside the warehouse bucket", location);
+    /// A table at the bucket root would own every object in the bucket.
+    if (warehouse.objectKey(location).empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "'location' {} must not be the bucket root", location);
+}
+
 /// The handler maps `BAD_ARGUMENTS` to a 400 response.
 void validateNamespace(const IcebergNamespaceName & name)
 {
@@ -626,10 +646,11 @@ Poco::JSON::Object::Ptr IcebergRESTCatalogHandler::readTableMetadata(
 }
 
 void IcebergRESTCatalogHandler::sendLoadTableResult(
-    const String & metadata_location, const Poco::JSON::Object::Ptr & metadata, HTTPServerResponse & response)
+    const std::optional<String> & metadata_location, const Poco::JSON::Object::Ptr & metadata, HTTPServerResponse & response)
 {
     Poco::JSON::Object result;
-    result.set("metadata-location", metadata_location);
+    if (metadata_location)
+        result.set("metadata-location", *metadata_location);
     result.set("metadata", metadata);
     /// TODO: Add credential vending yet. For now, clients use their own storage credentials.
     result.set("config", Poco::JSON::Object());
@@ -718,10 +739,10 @@ void IcebergRESTCatalogHandler::handleCreateTable(
     const auto uuid = toString(UUIDHelpers::generateV4());
 
     String name;
+    bool stage_create = false;
     IcebergTablePointer pointer{.uuid = uuid, .metadata_location = {}};
     CompressionMethod compression_method = CompressionMethod::None;
     String location;
-    String object_key;
     String metadata_dir_key;
     Poco::JSON::Object::Ptr metadata;
     try
@@ -733,9 +754,8 @@ void IcebergRESTCatalogHandler::handleCreateTable(
         name = json->getValue<String>("name");
         validateTableName(name);
 
-        /// TODO: Stage-create means "write the metadata, do not register it". Needed for CTAS.
-        if (json->optValue<bool>("stage-create", false))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "stage-create is not supported");
+        /// A staged table is returned but not stored. Its first commit, with `assert-create`, creates it. Needed for CTAS.
+        stage_create = json->optValue<bool>("stage-create", false);
 
         if (json->has("location") && !json->isNull("location"))
         {
@@ -753,15 +773,7 @@ void IcebergRESTCatalogHandler::handleCreateTable(
             location = fmt::format("{}/{}/{}-{}", warehouse.base_location, fmt::join(ns, "/"), name, uuid);
         }
 
-        /// The ClickHouse client sends a bare key unless `write_full_path_in_iceberg_metadata` is set. Name the problem.
-        if (!hasS3Scheme(location))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "'location' {} must be an s3:// URI", location);
-        /// The server has credentials for one bucket only.
-        if (!warehouse.isInBucket(location))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "'location' {} must be inside the warehouse bucket", location);
-        /// A table at the bucket root would own every object in the bucket.
-        if (warehouse.objectKey(location).empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "'location' {} must not be the bucket root", location);
+        validateTableLocation(warehouse, location);
 
         std::map<String, String> properties;
         if (const auto properties_object = getOptionalObject(*json, "properties"))
@@ -779,10 +791,7 @@ void IcebergRESTCatalogHandler::handleCreateTable(
             std::move(properties));
         compression_method = getMetadataCompressionMethod(*metadata);
 
-        /// Same naming as the ClickHouse Iceberg writer: `<location>/metadata/v<version>-<uuid>.metadata.json`, starting at 1.
-        pointer.metadata_location
-            = fmt::format("{}/metadata/v1-{}{}.metadata.json", location, uuid, getMetadataCompressionSuffix(compression_method));
-        object_key = warehouse.objectKey(pointer.metadata_location);
+        pointer.metadata_location = firstMetadataLocation(location, uuid, compression_method);
         metadata_dir_key = warehouse.objectKey(location + "/metadata/");
     }
     /// `Exception` derives from `Poco::Exception`, so it goes first.
@@ -819,24 +828,25 @@ void IcebergRESTCatalogHandler::handleCreateTable(
         return;
     }
 
-    /// Object storage first, then the Keeper pointer. A crash in between leaves an orphan file, not a dangling pointer.
-    writeNewObject(
-        *warehouse.object_storage,
-        object_key,
-        toJSONString(*metadata, 4),
-        server.context()->getWriteSettings(),
-        compression_method,
-        static_cast<int>(server.context()->getSettingsRef()[Setting::output_format_compression_level]));
-
-    /// A Keeper exception (timeout, session loss) leaves the file. The node may exist, so deleting could leave a dangling pointer.
-    using CreateTableResult = KeeperIcebergRESTCatalogStore::CreateTableResult;
-    const auto created = warehouse.store->createTable(ns, name, pointer);
-    if (created != CreateTableResult::Created)
+    if (stage_create)
     {
-        LOG_INFO(log, "Removing metadata file {} because table {}.{} was not registered", object_key, joinNamespace(ns), name);
-        warehouse.object_storage->removeObjectIfExists(StoredObject(object_key));
+        /// Only an early answer. The create commit checks again.
+        if (warehouse.store->tableExists(ns, name))
+        {
+            sendError(
+                response,
+                Poco::Net::HTTPResponse::HTTP_CONFLICT,
+                "TableAlreadyExistsException",
+                fmt::format("Table already exists: {}.{}", joinNamespace(ns), name));
+            return;
+        }
+        LOG_INFO(log, "Staged table {}.{} at {}", joinNamespace(ns), name, location);
+        sendLoadTableResult(std::nullopt, metadata, response);
+        return;
     }
 
+    using CreateTableResult = KeeperIcebergRESTCatalogStore::CreateTableResult;
+    const auto created = writeAndRegisterTable(warehouse, ns, name, pointer, metadata, compression_method);
     if (created == CreateTableResult::TableExists)
     {
         sendError(
@@ -876,13 +886,9 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
     if (!body)
         return;
 
+    /// A missing table may be a staged one, which the commit creates.
     const auto pointer = warehouse.store->getTable(*ns, table);
-    if (!pointer)
-    {
-        sendNoSuchTable(response, *ns, table);
-        return;
-    }
-    auto metadata = readTableMetadata(warehouse, *pointer);
+    auto metadata = pointer ? readTableMetadata(warehouse, *pointer) : nullptr;
 
     CompressionMethod compression_method = CompressionMethod::None;
     try
@@ -891,20 +897,36 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
         const auto requirements = getArray(*json, "requirements");
         const auto updates = getArray(*json, "updates");
 
-        if (const auto failed = checkTableRequirements(*metadata, *requirements))
+        if (!pointer && !hasAssertCreate(*requirements))
+        {
+            sendNoSuchTable(response, *ns, table);
+            return;
+        }
+
+        if (const auto failed = checkTableRequirements(metadata.get(), *requirements))
         {
             sendError(response, Poco::Net::HTTPResponse::HTTP_CONFLICT, "CommitFailedException", *failed);
             return;
         }
 
-        /// Do not write a new metadata version for an empty commit.
-        if (updates->size() == 0)
+        if (!pointer)
         {
+            checkDDLAllowed(context, "create table");
+            validateTableName(table);
+            metadata = buildCreatedTableMetadata(*updates);
+            validateTableLocation(warehouse, getString(*metadata, Iceberg::f_location));
+        }
+        else if (updates->size() == 0)
+        {
+            /// Do not write a new metadata version for an empty commit.
             sendCommitTableResult(pointer->metadata_location, metadata, response);
             return;
         }
+        else
+        {
+            applyTableUpdates(*metadata, *updates, pointer->metadata_location);
+        }
 
-        applyTableUpdates(*metadata, *updates, pointer->metadata_location);
         /// A `set-properties` update may change the codec. The new file follows the updated properties.
         compression_method = getMetadataCompressionMethod(*metadata);
     }
@@ -922,7 +944,72 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
         return;
     }
 
-    commitTableMetadata(warehouse, *ns, table, *pointer, metadata, compression_method, response);
+    if (pointer)
+        commitTableMetadata(warehouse, *ns, table, *pointer, metadata, compression_method, response);
+    else
+        commitStagedTable(warehouse, *ns, table, metadata, compression_method, response);
+}
+
+KeeperIcebergRESTCatalogStore::CreateTableResult IcebergRESTCatalogHandler::writeAndRegisterTable(
+    const IcebergRESTCatalogWarehouse & warehouse,
+    const IcebergNamespaceName & ns,
+    const String & table,
+    const IcebergTablePointer & pointer,
+    const Poco::JSON::Object::Ptr & metadata,
+    CompressionMethod compression_method) const
+{
+    /// Object storage first, then the Keeper pointer. A crash in between leaves an orphan file, not a dangling pointer.
+    const auto object_key = warehouse.objectKey(pointer.metadata_location);
+    writeNewObject(
+        *warehouse.object_storage,
+        object_key,
+        toJSONString(*metadata, 4),
+        server.context()->getWriteSettings(),
+        compression_method,
+        static_cast<int>(server.context()->getSettingsRef()[Setting::output_format_compression_level]));
+
+    /// A Keeper exception (timeout, session loss) leaves the file. The node may exist, so deleting could leave a dangling pointer.
+    using CreateTableResult = KeeperIcebergRESTCatalogStore::CreateTableResult;
+    const auto created = warehouse.store->createTable(ns, table, pointer);
+    if (created != CreateTableResult::Created)
+    {
+        LOG_INFO(log, "Removing metadata file {} because table {}.{} was not registered", object_key, joinNamespace(ns), table);
+        warehouse.object_storage->removeObjectIfExists(StoredObject(object_key));
+    }
+    return created;
+}
+
+void IcebergRESTCatalogHandler::commitStagedTable(
+    const IcebergRESTCatalogWarehouse & warehouse,
+    const IcebergNamespaceName & ns,
+    const String & table,
+    const Poco::JSON::Object::Ptr & metadata,
+    CompressionMethod compression_method,
+    HTTPServerResponse & response) const
+{
+    const auto uuid = getString(*metadata, Iceberg::f_table_uuid);
+    const IcebergTablePointer pointer{
+        .uuid = uuid,
+        .metadata_location = firstMetadataLocation(getString(*metadata, Iceberg::f_location), uuid, compression_method)};
+
+    using CreateTableResult = KeeperIcebergRESTCatalogStore::CreateTableResult;
+    switch (writeAndRegisterTable(warehouse, ns, table, pointer, metadata, compression_method))
+    {
+        case CreateTableResult::Created:
+            LOG_INFO(log, "Created staged table {}.{} at {}", joinNamespace(ns), table, pointer.metadata_location);
+            sendCommitTableResult(pointer.metadata_location, metadata, response);
+            return;
+        case CreateTableResult::TableExists:
+            sendError(
+                response,
+                Poco::Net::HTTPResponse::HTTP_CONFLICT,
+                "CommitFailedException",
+                fmt::format("Table already exists: {}.{}", joinNamespace(ns), table));
+            return;
+        case CreateTableResult::NamespaceMissing:
+            sendNoSuchNamespace(response, ns);
+            return;
+    }
 }
 
 void IcebergRESTCatalogHandler::commitTableMetadata(
