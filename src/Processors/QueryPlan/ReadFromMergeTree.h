@@ -403,6 +403,9 @@ public:
     bool requestReadingInOrder(size_t prefix_size, int direction, size_t read_limit, size_t query_limit = 0);
     bool setVirtualRowConversions(ActionsDAG virtual_row_conversion_);
     void resetVirtualRowConversions() { virtual_row_conversion = nullptr; }
+
+    /// Whether the FINAL merges of this read can carry virtual rows (see `IMergingTransform::enableVirtualRowAnnouncement`).
+    bool canUseVirtualRowWithFinal() const;
     bool readsInOrder() const;
     const InputOrderInfoPtr & getInputOrder() const { return query_info.input_order_info; }
     const SortDescription & getSortDescription() const override { return result_sort_description; }
