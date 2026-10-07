@@ -888,8 +888,8 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
     const auto pointer = warehouse.store->getTable(*ns, table);
     if (!pointer)
     {
-        /// Creates the table if the commit has `assert-create`. Else sends 404.
-        handleCommitToMissingTable(warehouse, *ns, table, *body, response, context);
+        /// The table may be staged. A commit with `assert-create` creates it.
+        handleStagedCreateCommit(warehouse, *ns, table, *body, response, context);
         return;
     }
     auto metadata = readTableMetadata(warehouse, *pointer);
@@ -935,7 +935,7 @@ void IcebergRESTCatalogHandler::handleUpdateTable(
     commitTableMetadata(warehouse, *ns, table, *pointer, metadata, compression_method, response);
 }
 
-void IcebergRESTCatalogHandler::handleCommitToMissingTable(
+void IcebergRESTCatalogHandler::handleStagedCreateCommit(
     const IcebergRESTCatalogWarehouse & warehouse,
     const IcebergNamespaceName & ns,
     const String & table,

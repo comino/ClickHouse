@@ -46,8 +46,8 @@ private:
     void handleDropTable(const IcebergRESTCatalogWarehouse & warehouse, const IcebergRESTRouteMatch & match, const Poco::URI & uri, HTTPServerResponse & response, const Context & context) const;
     void handleUpdateTable(const IcebergRESTCatalogWarehouse & warehouse, const IcebergRESTRouteMatch & match, HTTPServerRequest & request, HTTPServerResponse & response, const Context & context) const;
 
-    /// Handles a commit to a missing table. Creates the table if the commit has `assert-create`. Else sends 404.
-    void handleCommitToMissingTable(
+    /// Finishes a stage-create: a commit with `assert-create` to a table that does not exist yet. Sends 404 without `assert-create`.
+    void handleStagedCreateCommit(
         const IcebergRESTCatalogWarehouse & warehouse,
         const IcebergNamespaceName & ns,
         const String & table,
