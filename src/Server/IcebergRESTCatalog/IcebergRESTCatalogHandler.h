@@ -64,15 +64,6 @@ private:
         const Poco::JSON::Object::Ptr & metadata,
         CompressionMethod compression_method) const;
 
-    /// Creates a table from the metadata built by a commit with `assert-create`. Sends the response.
-    void createTableFromCommit(
-        const IcebergRESTCatalogWarehouse & warehouse,
-        const IcebergNamespaceName & ns,
-        const String & table,
-        const Poco::JSON::Object::Ptr & metadata,
-        CompressionMethod compression_method,
-        HTTPServerResponse & response) const;
-
     /// Writes the new metadata file and moves the table pointer to it with a version check. Sends the response.
     void commitTableMetadata(
         const IcebergRESTCatalogWarehouse & warehouse,

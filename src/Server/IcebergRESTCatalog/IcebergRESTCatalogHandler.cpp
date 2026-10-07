@@ -945,6 +945,7 @@ void IcebergRESTCatalogHandler::handleCommitToMissingTable(
 {
     Poco::JSON::Object::Ptr metadata;
     CompressionMethod compression_method = CompressionMethod::None;
+    IcebergTablePointer pointer;
     try
     {
         const auto json = Poco::JSON::Parser().parse(body).extract<Poco::JSON::Object::Ptr>();
@@ -966,8 +967,12 @@ void IcebergRESTCatalogHandler::handleCommitToMissingTable(
         checkDDLAllowed(context, "create table");
         validateTableName(table);
         metadata = buildCreatedTableMetadata(*updates);
-        validateTableLocation(warehouse, getString(*metadata, Iceberg::f_location));
+        const auto location = getString(*metadata, Iceberg::f_location);
+        validateTableLocation(warehouse, location);
         compression_method = getMetadataCompressionMethod(*metadata);
+
+        pointer.uuid = getString(*metadata, Iceberg::f_table_uuid);
+        pointer.metadata_location = firstMetadataLocation(location, pointer.uuid, compression_method);
     }
     catch (const Exception & e)
     {
@@ -983,7 +988,24 @@ void IcebergRESTCatalogHandler::handleCommitToMissingTable(
         return;
     }
 
-    createTableFromCommit(warehouse, ns, table, metadata, compression_method, response);
+    using CreateTableResult = KeeperIcebergRESTCatalogStore::CreateTableResult;
+    switch (writeAndRegisterTable(warehouse, ns, table, pointer, metadata, compression_method))
+    {
+        case CreateTableResult::Created:
+            LOG_INFO(log, "Created table {}.{} at {}", joinNamespace(ns), table, pointer.metadata_location);
+            sendCommitTableResult(pointer.metadata_location, metadata, response);
+            return;
+        case CreateTableResult::TableExists:
+            sendError(
+                response,
+                Poco::Net::HTTPResponse::HTTP_CONFLICT,
+                "CommitFailedException",
+                fmt::format("Table already exists: {}.{}", joinNamespace(ns), table));
+            return;
+        case CreateTableResult::NamespaceMissing:
+            sendNoSuchNamespace(response, ns);
+            return;
+    }
 }
 
 KeeperIcebergRESTCatalogStore::CreateTableResult IcebergRESTCatalogHandler::writeAndRegisterTable(
@@ -1013,39 +1035,6 @@ KeeperIcebergRESTCatalogStore::CreateTableResult IcebergRESTCatalogHandler::writ
         warehouse.object_storage->removeObjectIfExists(StoredObject(object_key));
     }
     return created;
-}
-
-void IcebergRESTCatalogHandler::createTableFromCommit(
-    const IcebergRESTCatalogWarehouse & warehouse,
-    const IcebergNamespaceName & ns,
-    const String & table,
-    const Poco::JSON::Object::Ptr & metadata,
-    CompressionMethod compression_method,
-    HTTPServerResponse & response) const
-{
-    const auto uuid = getString(*metadata, Iceberg::f_table_uuid);
-    const IcebergTablePointer pointer{
-        .uuid = uuid,
-        .metadata_location = firstMetadataLocation(getString(*metadata, Iceberg::f_location), uuid, compression_method)};
-
-    using CreateTableResult = KeeperIcebergRESTCatalogStore::CreateTableResult;
-    switch (writeAndRegisterTable(warehouse, ns, table, pointer, metadata, compression_method))
-    {
-        case CreateTableResult::Created:
-            LOG_INFO(log, "Created table {}.{} at {}", joinNamespace(ns), table, pointer.metadata_location);
-            sendCommitTableResult(pointer.metadata_location, metadata, response);
-            return;
-        case CreateTableResult::TableExists:
-            sendError(
-                response,
-                Poco::Net::HTTPResponse::HTTP_CONFLICT,
-                "CommitFailedException",
-                fmt::format("Table already exists: {}.{}", joinNamespace(ns), table));
-            return;
-        case CreateTableResult::NamespaceMissing:
-            sendNoSuchNamespace(response, ns);
-            return;
-    }
 }
 
 void IcebergRESTCatalogHandler::commitTableMetadata(
