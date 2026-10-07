@@ -407,7 +407,7 @@ bool tryWriteVersionHintFile(
     /// Once any writer has created `version-hint.text`, every subsequent writer must keep it in
     /// sync, otherwise readers with `iceberg_use_version_hint = 1` observe stale data when a
     /// writer that does not have the setting enabled advances the table.
-    for (size_t attempt=0; attempt < MAX_TRANSACTION_RETRIES; ++attempt)
+    for (size_t attempt = 0; attempt < MAX_TRANSACTION_RETRIES; ++attempt)
     {
         StoredObject object_info(storage_version_hint_path);
         std::string version_hint_value;
