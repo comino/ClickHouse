@@ -71,27 +71,33 @@ void RabbitMQConsumer::closeConnections()
     auto closing = std::make_shared<ChannelCloseState>();
     close_state = closing;
 
-    consumer_channel->close()
-    .onSuccess([this, closing]()
+    event_handler.run([&]
     {
-        if (closing->abandoned)
-            return;
-        LOG_TRACE(log, "Consumer channel {} is closed", channel_id);
-        closing->completed = true;
-        event_handler.stopBlockingLoop();
-    })
-    .onError([this, closing](const char * message)
-    {
-        if (closing->abandoned)
-            return;
-        LOG_ERROR(log, "Failed to close consumer channel {}: {}", channel_id, message);
-        /// An error also completes the wait: a channel that could not be closed is not going to
-        /// keep holding the queue, and treating it as outstanding would burn the whole timeout.
-        closing->completed = true;
-        event_handler.stopBlockingLoop();
+        consumer_channel->close()
+        .onSuccess([this, closing]()
+        {
+            if (closing->abandoned)
+                return;
+            LOG_TRACE(log, "Consumer channel {} is closed", channel_id);
+            closing->completed = true;
+            event_handler.stopBlockingLoop();
+        })
+        .onError([this, closing](const char * message)
+        {
+            if (closing->abandoned)
+                return;
+            LOG_ERROR(log, "Failed to close consumer channel {}: {}", channel_id, message);
+            /// An error also completes the wait: a channel that could not be closed is not going to
+            /// keep holding the queue, and treating it as outstanding would burn the whole timeout.
+            closing->completed = true;
+            event_handler.stopBlockingLoop();
+        });
     });
 }
 
+/// Nothing may propagate out of a libuv callback (see RabbitMQHandler::runLoop): an exception
+/// (e.g. the memory limit while copying a message) puts the channel in the error state instead, so
+/// it is replaced and the broker redelivers what was not acked.
 void RabbitMQConsumer::subscribe()
 {
     for (const auto & queue_name : queues)
@@ -105,16 +111,24 @@ void RabbitMQConsumer::subscribe()
         })
         .onReceived([&](const AMQP::Message & message, uint64_t delivery_tag, bool redelivered)
         {
-            /// Empty messages are queued too: they hold a prefetch slot until acked.
-            MessageData result{
-                .message = std::string(message.body(), message.body() + message.bodySize()),
-                .message_id = message.hasMessageID() ? message.messageID() : "",
-                .timestamp = message.hasTimestamp() ? message.timestamp() : 0,
-                .redelivered = redelivered,
-                .delivery_tag = delivery_tag,
-                .channel_id = channel_id};
+            try
+            {
+                /// Empty messages are queued too: they hold a prefetch slot until acked.
+                MessageData result{
+                    .message = std::string(message.body(), message.body() + message.bodySize()),
+                    .message_id = message.hasMessageID() ? message.messageID() : "",
+                    .timestamp = message.hasTimestamp() ? message.timestamp() : 0,
+                    .redelivered = redelivered,
+                    .delivery_tag = delivery_tag,
+                    .channel_id = channel_id};
 
-            pushMessage(std::move(result));
+                pushMessage(std::move(result));
+            }
+            catch (...)
+            {
+                state = State::ERROR;
+                tryLogCurrentException(log, "Failed to receive a message");
+            }
         })
         .onError([&](const char * message)
         {
@@ -122,14 +136,36 @@ void RabbitMQConsumer::subscribe()
              * or consume call error, which arises from queue settings mismatch or queue level error,
              * which should not happen as no one else is supposed to touch them
              */
-            LOG_ERROR(log, "Consumer failed on channel {}. Reason: {}", channel_id, message);
             state = State::ERROR;
+            try
+            {
+                LOG_ERROR(log, "Consumer failed on channel {}. Reason: {}", channel_id, message);
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log);
+            }
         });
     }
 }
 
+String RabbitMQConsumer::getChannelID() const
+{
+    return event_handler.run([this] { return channel_id; });
+}
+
 
 bool RabbitMQConsumer::ackMessages(const CommitInfo & commit_info)
+{
+    return event_handler.run([&] { return ackMessagesImpl(commit_info); });
+}
+
+bool RabbitMQConsumer::nackMessages(const CommitInfo & commit_info, bool requeue)
+{
+    return event_handler.run([&] { return nackMessagesImpl(commit_info, requeue); });
+}
+
+bool RabbitMQConsumer::ackMessagesImpl(const CommitInfo & commit_info)
 {
     if (state != State::OK)
     {
@@ -183,7 +219,7 @@ bool RabbitMQConsumer::ackMessages(const CommitInfo & commit_info)
     return false;
 }
 
-bool RabbitMQConsumer::nackMessages(const CommitInfo & commit_info, bool requeue)
+bool RabbitMQConsumer::nackMessagesImpl(const CommitInfo & commit_info, bool requeue)
 {
     const int flags = requeue ? (AMQP::multiple | AMQP::requeue) : AMQP::multiple;
     const char * verb = requeue ? "requeue" : "nack";
@@ -241,45 +277,53 @@ bool RabbitMQConsumer::nackMessages(const CommitInfo & commit_info, bool requeue
 
 void RabbitMQConsumer::updateChannel(RabbitMQConnection & connection)
 {
-    state = State::INITIALIZING;
-    last_commited_delivery_tag = 0;
-
-    consumer_channel = connection.createChannel();
-    consumer_channel->onReady([&]()
+    event_handler.run([&]
     {
-        try
+        state = State::INITIALIZING;
+        last_commited_delivery_tag = 0;
+
+        consumer_channel = connection.createChannel();
+        consumer_channel->onReady([&]()
         {
-            /// 1. channel_id_base - indicates current consumer buffer.
-            /// 2. channel_id_couner - indicates serial number of created channel for current buffer
-            ///    (incremented on each channel update).
-            /// 3. channel_base is to guarantee that channel_id is unique for each table.
-            channel_id = fmt::format("{}_{}_{}", channel_id_base, channel_id_counter++, channel_base);
+            try
+            {
+                /// 1. channel_id_base - indicates current consumer buffer.
+                /// 2. channel_id_couner - indicates serial number of created channel for current buffer
+                ///    (incremented on each channel update).
+                /// 3. channel_base is to guarantee that channel_id is unique for each table.
+                channel_id = fmt::format("{}_{}_{}", channel_id_base, channel_id_counter++, channel_base);
 
-            LOG_TRACE(log, "Channel {} is successfully created", channel_id);
+                LOG_TRACE(log, "Channel {} is successfully created", channel_id);
 
-            subscriptions_num = 0;
-            consumer_channel->setQos(prefetch_count);
-            subscribe();
+                subscriptions_num = 0;
+                consumer_channel->setQos(prefetch_count);
+                subscribe();
 
-            state = State::OK;
-        }
-        catch (...)
+                state = State::OK;
+            }
+            catch (...)
+            {
+                state = State::ERROR;
+                tryLogCurrentException(__PRETTY_FUNCTION__);
+            }
+        });
+
+        consumer_channel->onError([&](const char * message)
         {
-            state = State::ERROR;
-            tryLogCurrentException(__PRETTY_FUNCTION__);
-        }
-    });
+            if (!consumer_channel->usable() || !consumer_channel->connected())
+                state = State::ERROR;
 
-    consumer_channel->onError([&](const char * message)
-    {
-        LOG_ERROR(
-            log, "Channel {} received an error: {} (usable: {}, connected: {})",
-            channel_id, message, consumer_channel->usable(), consumer_channel->connected());
-
-        if (!consumer_channel->usable() || !consumer_channel->connected())
-        {
-            state = State::ERROR;
-        }
+            try
+            {
+                LOG_ERROR(
+                    log, "Channel {} received an error: {} (usable: {}, connected: {})",
+                    channel_id, message, consumer_channel->usable(), consumer_channel->connected());
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log);
+            }
+        });
     });
 }
 

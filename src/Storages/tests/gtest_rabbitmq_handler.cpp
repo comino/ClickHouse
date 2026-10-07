@@ -7,10 +7,146 @@
 #include <Storages/RabbitMQ/RabbitMQHandler.h>
 #include <Common/logger_useful.h>
 
+#include <atomic>
 #include <chrono>
+#include <ctime>
+#include <stdexcept>
 #include <thread>
 
 using namespace DB;
+
+/// Every AMQP-CPP call must happen on the loop thread, so run() has to hop there while the thread
+/// runs, execute inline when there is none (setup, cleanup, producer), and not deadlock when called
+/// from the loop thread itself (a task creating a channel through the connection).
+TEST(RabbitMQHandler, RunExecutesOnLoopThread)
+{
+    UVLoop loop;
+    RabbitMQHandler handler(loop.getLoop(), getLogger("RabbitMQHandlerTest"));
+    const auto self = std::this_thread::get_id();
+    auto current_thread = [] { return std::this_thread::get_id(); };
+
+    EXPECT_FALSE(handler.loopRunning());
+    EXPECT_EQ(handler.run(current_thread), self);
+
+    handler.startLoop();
+    EXPECT_TRUE(handler.loopRunning());
+    const auto loop_thread = handler.run(current_thread);
+    EXPECT_NE(loop_thread, self);
+    EXPECT_EQ(handler.run([&] { return handler.run(current_thread); }), loop_thread);
+    EXPECT_THROW(handler.run([] { throw std::runtime_error("boom"); }), std::runtime_error);
+
+    handler.stopLoop();
+    EXPECT_FALSE(handler.loopRunning());
+    EXPECT_EQ(handler.run(current_thread), self);
+}
+
+/// An exception escaping a libuv callback ends the loop thread (nothing may unwind through libuv
+/// unnoticed), but it must not wedge the table: run() falls back to executing inline, and the next
+/// startLoop() replaces the dead thread.
+TEST(RabbitMQHandler, CallbackExceptionDoesNotWedgeRun)
+{
+    UVLoop loop;
+    RabbitMQHandler handler(loop.getLoop(), getLogger("RabbitMQHandlerTest"));
+    const auto self = std::this_thread::get_id();
+    auto current_thread = [] { return std::this_thread::get_id(); };
+
+    handler.startLoop();
+    uv_timer_t thrower;
+    handler.run([&]
+    {
+        uv_timer_init(loop.getLoop(), &thrower);
+        uv_timer_start(&thrower, [](uv_timer_t *) { throw std::runtime_error("boom"); }, /* timeout_ms = */ 1, /* repeat = */ 0);
+    });
+
+    for (size_t i = 0; i < 500 && handler.loopRunning(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_FALSE(handler.loopRunning());
+
+    /// Dead thread: no hang, inline execution.
+    EXPECT_EQ(handler.run(current_thread), self);
+
+    handler.startLoop();
+    EXPECT_TRUE(handler.loopRunning());
+    EXPECT_NE(handler.run(current_thread), self);
+    handler.run([&] { uv_close(reinterpret_cast<uv_handle_t *>(&thrower), nullptr); });
+    handler.stopLoop();
+}
+
+/// start / post / stop in a tight loop against a thread that calls run() continuously: exercises the hand-off
+/// between inline execution and the loop thread on start, and the drain of tasks queued during a stop.
+/// AMQP-CPP is not thread safe, so no two tasks may ever overlap.
+TEST(RabbitMQHandler, StartPostStopRace)
+{
+    UVLoop loop;
+    RabbitMQHandler handler(loop.getLoop(), getLogger("RabbitMQHandlerTest"));
+
+    std::atomic<size_t> executed{0};
+    std::atomic<size_t> executed_by_poster{0};
+    std::atomic<int> inside{0};
+    std::atomic<bool> overlap{false};
+    auto task = [&]
+    {
+        if (inside.fetch_add(1) != 0)
+            overlap = true;
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+        inside.fetch_sub(1);
+        ++executed;
+    };
+
+    std::atomic<bool> done{false};
+    std::thread poster([&]
+    {
+        while (!done)
+        {
+            handler.run(task);
+            ++executed_by_poster;
+            /// The mutexes are not fair: without a pause this thread would starve startLoop() and stopLoop().
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+    });
+
+    for (size_t i = 0; i < 300 && !overlap; ++i)
+    {
+        handler.startLoop();
+        handler.run(task);
+        handler.stopLoop();
+        handler.run(task);
+    }
+
+    done = true;
+    poster.join();
+    EXPECT_FALSE(overlap) << "two tasks ran at the same time";
+    EXPECT_GE(executed, 600u);
+    EXPECT_GT(executed_by_poster, 0u) << "the competing thread never ran a task";
+}
+
+/// The loop thread blocks in the poller between events. The previous implementation spun
+/// uv_run(UV_RUN_NOWAIT) + yield and burned a core per table while a cycle waited for its flush
+/// interval.
+TEST(RabbitMQHandler, IdleLoopThreadDoesNotSpin)
+{
+    UVLoop loop;
+    RabbitMQHandler handler(loop.getLoop(), getLogger("RabbitMQHandlerTest"));
+    handler.startLoop();
+
+    auto loop_thread_cpu_ms = [&]
+    {
+        return handler.run([]
+        {
+            timespec ts{};
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+            return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        });
+    };
+
+    const auto before = loop_thread_cpu_ms();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto after = loop_thread_cpu_ms();
+    handler.stopLoop();
+
+    /// A spinning loop would burn ~500 ms here.
+    EXPECT_LT(after - before, 50);
+}
 
 /// Regression test for the dead-connection hang (issue #108496). When RabbitMQ closes the
 /// connection without a clean AMQP handshake, the broker callbacks that would call

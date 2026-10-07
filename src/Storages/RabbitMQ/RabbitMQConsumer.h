@@ -57,7 +57,8 @@ public:
     };
 
     const MessageData & currentMessage() { return current; }
-    const String & getChannelID() const { return channel_id; }
+    /// Read on the event loop thread, which is the one that sets it.
+    String getChannelID() const;
     UInt16 getPrefetchCount() const { return prefetch_count; }
 
     /// Return read buffer containing next available message
@@ -70,6 +71,7 @@ public:
     void stop();
     bool isConsumerStopped() const { return stopped.load(); }
 
+    /// Sent on the event loop thread; the call returns once the frame has been handed to AMQP-CPP.
     bool ackMessages(const CommitInfo & commit_info);
     bool nackMessages(const CommitInfo & commit_info, bool requeue = false);
 
@@ -101,7 +103,8 @@ public:
 
 private:
     void subscribe();
-    bool isChannelUsable();
+    bool ackMessagesImpl(const CommitInfo & commit_info);
+    bool nackMessagesImpl(const CommitInfo & commit_info, bool requeue);
     void updateCommitInfo(CommitInfo record);
 
     /// Shared by value into the close() callbacks, mirroring RabbitMQProducer::finish, so that a
@@ -113,14 +116,14 @@ private:
     };
     std::shared_ptr<ChannelCloseState> close_state;
 
-    ChannelPtr consumer_channel;
+    ChannelPtr consumer_channel; /// Touched only on the event loop thread (see RabbitMQHandler::run).
     RabbitMQHandler & event_handler; /// Used concurrently, but is thread safe.
 
     const std::vector<String> queues;
     const String channel_base;
     const size_t channel_id_base;
     /// basic.qos per queue subscription. It bounds `received`, which must never block the event loop thread:
-    /// the streaming thread waits for that loop to stop, see https://github.com/ClickHouse/ClickHouse/issues/54775.
+    /// the streaming thread waits for that thread's answers, see https://github.com/ClickHouse/ClickHouse/issues/54775.
     const UInt16 prefetch_count;
 
     LoggerPtr log;
