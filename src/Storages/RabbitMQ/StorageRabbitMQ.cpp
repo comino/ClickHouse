@@ -1422,14 +1422,16 @@ bool StorageRabbitMQ::streamToViews(UInt64 cycle_epoch, bool drive_loop_on_worke
         insert->columns = std::move(column_list);
     }
 
-    // Only insert into dependent views and expect that input blocks contain virtual columns
+    // Only insert into dependent views and expect that input blocks contain virtual columns.
+    // Squash the per-consumer blocks of a cycle that are smaller than max_block_size before pushing to views; squashing
+    // flushes when the sources finish, so nothing is held back past executor.execute() and the acks below stay correct.
     InterpreterInsertQuery interpreter(
         insert,
         new_context,
         /* allow_materialized */ false,
-        /* no_squash */ true,
+        /* no_squash */ false,
         /* no_destination */ true,
-        /* async_isnert */ false);
+        /* async_insert */ false);
     auto block_io = interpreter.execute();
 
     block_io.pipeline.complete(Pipe::unitePipes(std::move(pipes)));
@@ -1672,7 +1674,7 @@ Optional parameters:
 - `rabbitmq_queue_base` - Specify a hint for queue names. Use cases of this setting are described below.
 - `rabbitmq_persistent` - If set to 1 (true), in insert query delivery mode will be set to 2 (marks messages as 'persistent'). Default: `0`.
 - `rabbitmq_skip_broken_messages` – RabbitMQ message parser tolerance to schema-incompatible messages per block. If `rabbitmq_skip_broken_messages = N` then the engine skips *N* RabbitMQ messages that cannot be parsed (a message equals a row of data). Default: `0`.
-- `rabbitmq_max_block_size` - Number of row collected before flushing data from RabbitMQ. Default: [max_insert_block_size](/reference/settings/session-settings/max-insert#max_insert_block_size).
+- `rabbitmq_max_block_size` - Number of rows collected by one consumer before flushing data from RabbitMQ. Blocks of all consumers of one flush that are smaller than [max_block_size](/reference/settings/session-settings/max#max_block_size) are squashed together before being inserted into materialized views. Default: [max_insert_block_size](/reference/settings/session-settings/max-insert#max_insert_block_size) divided by `rabbitmq_num_consumers`.
 - `rabbitmq_flush_interval_ms` - Timeout for flushing data from RabbitMQ. Default: [stream_flush_interval_ms](/reference/settings/session-settings/stream#stream_flush_interval_ms).
 - `rabbitmq_queue_settings_list` - allows to set RabbitMQ settings when creating a queue. Available settings: `x-max-length`, `x-max-length-bytes`, `x-message-ttl`, `x-expires`, `x-priority`, `x-max-priority`, `x-overflow`, `x-dead-letter-exchange`, `x-queue-type`. The `durable` setting is enabled automatically for the queue.
 - `rabbitmq_address` - Address for connection: `amqp(s)://user:password@host:port/vhost`. Use either this setting or `rabbitmq_host_port`; if both are set, `rabbitmq_address` is the one used. Its host and port are checked against [remote_url_allow_hosts](/reference/settings/server-settings/settings/remote#remote_url_allow_hosts).
